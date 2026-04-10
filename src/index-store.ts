@@ -1,6 +1,7 @@
-import * as fs from 'node:fs';
+import type { Dirent } from 'node:fs';
 import * as path from 'node:path';
 import { parseFrontmatter, type EngramMetadata } from './frontmatter.js';
+import { IFileSystem, NodeFileSystem } from './abstractions.js';
 
 export interface SearchFilters {
   category?: string;
@@ -19,15 +20,40 @@ export interface SearchResult {
 
 const EXCERPT_LENGTH = 2000;
 
+/** Written into `index.json` for interoperability (e.g. pi-agent-engrams). Not validated on load. */
+export const INDEX_JSON_VERSION = 3;
+
 /** Default minimum similarity score for search results (0.0 to 1.0) */
-export const DEFAULT_MIN_SEARCH_SCORE = 0.40;
+export const DEFAULT_MIN_SEARCH_SCORE = 0.4;
+
+interface IndexEntry {
+  relPath: string;
+  sourceDir: string;
+  mtime: number;
+  vector: number[];
+  excerpt: string;
+  metadata: EngramMetadata;
+}
+
+interface IndexData {
+  /** Optional when reading legacy or hand-edited files; always set on save. */
+  version?: number;
+  dimensions: number;
+  embeddingModelId: string;
+  providerFingerprint: string;
+  entries: Record<string, IndexEntry>;
+}
 
 export class EngramIndex {
   private entries: Map<string, IndexEntry> = new Map();
-  private config: EngramIndexConfig;
+  public config: EngramIndexConfig;
+  private fileSystem: IFileSystem;
+  private dirty = false;
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(config: EngramIndexConfig) {
+  constructor(config: EngramIndexConfig, fileSystem: IFileSystem = new NodeFileSystem()) {
     this.config = config;
+    this.fileSystem = fileSystem;
   }
 
   size(): number {
@@ -35,19 +61,75 @@ export class EngramIndex {
   }
 
   async load(): Promise<void> {
-    // For MCP server, we'll load on demand from the file system
-    // This is a simplified version - in production you might cache
+    if (!this.fileSystem.existsSync(this.config.indexJsonPath)) {
+      return;
+    }
+    try {
+      const raw = this.fileSystem.readFileSync(this.config.indexJsonPath, 'utf-8');
+      const parsed = JSON.parse(raw) as Partial<IndexData>;
+
+      // Strict validation: reject if extra fields exist
+      const keys = Object.keys(parsed);
+      const allowedKeys = new Set([
+        'version',
+        'dimensions',
+        'embeddingModelId',
+        'providerFingerprint',
+        'entries',
+      ]);
+      for (const key of keys) {
+        if (!allowedKeys.has(key)) {
+          console.warn(`index.json has unknown field '${key}', ignoring`);
+          return;
+        }
+      }
+
+      if (
+        typeof parsed.dimensions === 'number' &&
+        parsed.dimensions === this.config.dimensions &&
+        typeof parsed.embeddingModelId === 'string' &&
+        parsed.embeddingModelId === this.config.embeddingModelId &&
+        typeof parsed.providerFingerprint === 'string' &&
+        parsed.providerFingerprint === this.config.providerFingerprint &&
+        parsed.entries &&
+        typeof parsed.entries === 'object' &&
+        !Array.isArray(parsed.entries)
+      ) {
+        this.entries = new Map(Object.entries(parsed.entries));
+      }
+    } catch {
+      // Corrupted — start fresh in memory; sync will rebuild embeddings
+    }
+  }
+
+  private save(): void {
+    const dir = path.dirname(this.config.indexJsonPath);
+    this.fileSystem.mkdirSync(dir, { recursive: true });
+    const data: IndexData = {
+      version: INDEX_JSON_VERSION,
+      dimensions: this.config.dimensions,
+      embeddingModelId: this.config.embeddingModelId,
+      providerFingerprint: this.config.providerFingerprint,
+      entries: Object.fromEntries(this.entries),
+    };
+    this.fileSystem.writeFileSync(this.config.indexJsonPath, JSON.stringify(data), 'utf-8');
+    this.dirty = false;
+  }
+
+  private scheduleSave(): void {
+    if (this.saveTimer) return;
+    this.dirty = true;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      if (this.dirty) this.save();
+    }, 5000);
   }
 
   async sync(): Promise<{ added: number; updated: number; removed: number }> {
     const allFiles = this.scanAllFiles();
     const currentPaths = new Set(allFiles.map(f => f.absPath));
 
-    let added = 0;
-    let updated = 0;
     let removed = 0;
-
-    // Remove files that no longer exist
     for (const absPath of this.entries.keys()) {
       if (!currentPaths.has(absPath)) {
         this.entries.delete(absPath);
@@ -55,35 +137,64 @@ export class EngramIndex {
       }
     }
 
-    // Add/update existing files
+    const toEmbed: {
+      absPath: string;
+      relPath: string;
+      sourceDir: string;
+      mtime: number;
+      content: string;
+      metadata: EngramMetadata;
+    }[] = [];
+
     for (const file of allFiles) {
       const existing = this.entries.get(file.absPath);
-      const shouldUpdate = !existing || existing.mtime < file.mtime;
-
-      if (shouldUpdate) {
+      if (!existing || existing.mtime < file.mtime) {
         const result = this.readAndParseFile(file.absPath);
         if (result && result.content.trim().length > 20) {
-          const title = file.relPath.replace(/\.[^.]+$/, '').replace(/\//g, ' > ');
-          const text = `Title: ${title}\n\n${result.content}`;
-          const vector = await this.config.embedder.embed(text);
-
-          if (vector) {
-            this.entries.set(file.absPath, {
-              relPath: file.relPath,
-              sourceDir: file.sourceDir,
-              mtime: file.mtime,
-              vector,
-              excerpt: result.content.slice(0, EXCERPT_LENGTH),
-              metadata: result.metadata,
-            });
-            if (existing) {
-              updated++;
-            } else {
-              added++;
-            }
-          }
+          toEmbed.push({
+            absPath: file.absPath,
+            relPath: file.relPath,
+            sourceDir: file.sourceDir,
+            mtime: file.mtime,
+            content: result.content,
+            metadata: result.metadata,
+          });
         }
       }
+    }
+
+    let added = 0;
+    let updated = 0;
+
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < toEmbed.length; i += BATCH_SIZE) {
+      const batch = toEmbed.slice(i, i + BATCH_SIZE);
+      const texts = batch.map(f => {
+        const title = f.relPath.replace(/\.[^.]+$/, '').replace(/\//g, ' > ');
+        return `Title: ${title}\n\n${f.content}`;
+      });
+      const vectors = await this.config.embedder.embedBatch(texts);
+
+      for (let j = 0; j < batch.length; j++) {
+        const vector = vectors[j];
+        if (!vector?.length) continue;
+        const file = batch[j];
+        const isNew = !this.entries.has(file.absPath);
+        this.entries.set(file.absPath, {
+          relPath: file.relPath,
+          sourceDir: file.sourceDir,
+          mtime: file.mtime,
+          vector,
+          excerpt: file.content.slice(0, EXCERPT_LENGTH),
+          metadata: file.metadata,
+        });
+        if (isNew) added++;
+        else updated++;
+      }
+    }
+
+    if (added + updated + removed > 0) {
+      this.save();
     }
 
     return { added, updated, removed };
@@ -94,17 +205,13 @@ export class EngramIndex {
     await this.sync();
   }
 
-  async search(
-    query: string,
-    limit: number,
-    filters?: SearchFilters
-  ): Promise<SearchResult[]> {
+  async search(query: string, limit: number, filters?: SearchFilters): Promise<SearchResult[]> {
     const queryVector = await this.config.embedder.embed(query);
     const minScore = this.config.minSearchScore ?? DEFAULT_MIN_SEARCH_SCORE;
 
     const scored: { absPath: string; score: number }[] = [];
     for (const [absPath, entry] of this.entries.entries()) {
-      if (!entry.vector) continue;
+      if (!entry.vector?.length) continue;
       if (filters && !matchesFilters(entry.metadata, filters)) continue;
       let score = dotProduct(queryVector, entry.vector);
 
@@ -129,7 +236,7 @@ export class EngramIndex {
   }
 
   async updateFile(absPath: string, sourceDir: string): Promise<void> {
-    if (!fs.existsSync(absPath)) {
+    if (!this.fileSystem.existsSync(absPath)) {
       this.removeFile(absPath);
       return;
     }
@@ -137,7 +244,7 @@ export class EngramIndex {
     const relPath = path.relative(sourceDir, absPath);
     if (this.shouldSkip(relPath, path.basename(absPath))) return;
 
-    const stat = fs.statSync(absPath);
+    const stat = this.fileSystem.statSync(absPath);
     const result = this.readAndParseFile(absPath);
     if (!result || result.content.trim().length <= 20) {
       this.removeFile(absPath);
@@ -148,7 +255,7 @@ export class EngramIndex {
     const text = `Title: ${title}\n\n${result.content}`;
     const vector = await this.config.embedder.embed(text);
 
-    if (!vector) return;
+    if (!vector?.length) return;
 
     this.entries.set(absPath, {
       relPath,
@@ -158,10 +265,13 @@ export class EngramIndex {
       excerpt: result.content.slice(0, EXCERPT_LENGTH),
       metadata: result.metadata,
     });
+    this.scheduleSave();
   }
 
   removeFile(absPath: string): void {
-    this.entries.delete(absPath);
+    if (this.entries.delete(absPath)) {
+      this.scheduleSave();
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -195,14 +305,14 @@ export class EngramIndex {
       mtime: number;
     }[]
   ): void {
-    let entries: fs.Dirent[];
+    let dirents: Dirent[];
     try {
-      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+      dirents = this.fileSystem.readdirSync(currentDir, { withFileTypes: true });
     } catch {
       return;
     }
 
-    for (const entry of entries) {
+    for (const entry of dirents) {
       const absPath = path.join(currentDir, entry.name);
 
       if (entry.isDirectory()) {
@@ -216,7 +326,7 @@ export class EngramIndex {
         const relPath = path.relative(sourceDir, absPath);
         if (this.shouldSkip(relPath, entry.name)) continue;
         try {
-          const stat = fs.statSync(absPath);
+          const stat = this.fileSystem.statSync(absPath);
           results.push({ absPath, relPath, sourceDir, mtime: stat.mtimeMs });
         } catch {
           // Skip unreadable
@@ -241,7 +351,7 @@ export class EngramIndex {
    */
   private readAndParseFile(absPath: string): { content: string; metadata: EngramMetadata } | null {
     try {
-      const raw = fs.readFileSync(absPath, 'utf-8');
+      const raw = this.fileSystem.readFileSync(absPath, 'utf-8');
       const { metadata } = parseFrontmatter(raw);
       return { content: raw, metadata };
     } catch {
@@ -250,17 +360,17 @@ export class EngramIndex {
   }
 }
 
-interface IndexEntry {
-  relPath: string;
-  sourceDir: string;
-  mtime: number;
-  vector: number[];
-  excerpt: string;
-  metadata: EngramMetadata;
-}
-
 export interface EngramIndexConfig {
+  /** Absolute path to the docs directory (markdown engrams) */
   dir: string;
+  /** Absolute path to persisted vector index: `<store root>/index.json` (pi-agent-engrams compatible) */
+  indexJsonPath: string;
+  /** Embedding vector size; must match index.json when loading */
+  dimensions: number;
+  /** Resolved embedding model ID */
+  embeddingModelId: string;
+  /** Provider fingerprint for identity validation */
+  providerFingerprint: string;
   embedder: Embedder;
   minSearchScore?: number;
 }

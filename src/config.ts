@@ -36,8 +36,7 @@ export interface ConfigFile {
 /** Default when no model is set (suited to local OpenAI-compatible servers such as omlx). */
 export const DEFAULT_OPENAI_EMBEDDING_MODEL = 'Qwen3-Embedding-0.6B-4bit-DWQ';
 
-const configHome =
-  process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || '/tmp', '.config');
+const configHome = process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || '/tmp', '.config');
 
 const DEFAULT_ROOT = path.join(configHome, 'agent-engrams-mcp');
 

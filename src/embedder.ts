@@ -1,3 +1,5 @@
+import { IHttpFetch, createHttpFetch } from './abstractions.js';
+
 export interface EmbedderConfig {
   type: 'openai' | 'bedrock' | 'ollama';
   baseUrl?: string;
@@ -13,14 +15,15 @@ export interface Embedder {
   embedBatch(texts: string[]): Promise<number[][]>;
 }
 
-export function createEmbedder(config: EmbedderConfig): Embedder {
+export function createEmbedder(config: EmbedderConfig, httpFetch?: IHttpFetch): Embedder {
+  const fetchImpl = httpFetch || createHttpFetch();
   switch (config.type) {
     case 'openai':
-      return new OpenAIEmbedder(config);
+      return new OpenAIEmbedder(config, fetchImpl);
     case 'bedrock':
-      return new BedrockEmbedder(config);
+      return new BedrockEmbedder(config, fetchImpl);
     case 'ollama':
-      return new OllamaEmbedder(config);
+      return new OllamaEmbedder(config, fetchImpl);
     default:
       throw new Error(`Unknown embedder type: ${config.type}`);
   }
@@ -31,12 +34,14 @@ class OpenAIEmbedder implements Embedder {
   private model: string;
   private apiKey?: string;
   private dimensions: number;
+  private httpFetch: IHttpFetch;
 
-  constructor(config: EmbedderConfig) {
+  constructor(config: EmbedderConfig, httpFetch: IHttpFetch = createHttpFetch()) {
     this.baseUrl = config.baseUrl || 'http://localhost:11434/v1';
     this.model = config.model || 'Qwen3-Embedding-0.6B-4bit-DWQ';
     this.apiKey = config.apiKey;
     this.dimensions = config.dimensions;
+    this.httpFetch = httpFetch;
   }
 
   async embed(text: string): Promise<number[]> {
@@ -45,7 +50,7 @@ class OpenAIEmbedder implements Embedder {
   }
 
   async embedBatch(texts: string[]): Promise<number[][]> {
-    const response = await fetch(`${this.baseUrl}/embeddings`, {
+    const response = await this.httpFetch(`${this.baseUrl}/embeddings`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -71,14 +76,16 @@ class OpenAIEmbedder implements Embedder {
 class OllamaEmbedder implements Embedder {
   private url: string;
   private model: string;
+  private httpFetch: IHttpFetch;
 
-  constructor(config: EmbedderConfig) {
+  constructor(config: EmbedderConfig, httpFetch: IHttpFetch = createHttpFetch()) {
     this.url = config.baseUrl?.replace(/\/$/, '') || 'http://localhost:11434';
     this.model = config.model || 'nomic-embed-text';
+    this.httpFetch = httpFetch;
   }
 
   async embed(text: string): Promise<number[]> {
-    const res = await fetch(`${this.url}/api/embed`, {
+    const res = await this.httpFetch(`${this.url}/api/embed`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: this.model, input: text }),
@@ -114,12 +121,14 @@ class BedrockEmbedder implements Embedder {
   private model!: string;
   private dimensions!: number;
   private clientPromise: Promise<any>;
+  private httpFetch: IHttpFetch;
 
-  constructor(config: EmbedderConfig) {
+  constructor(config: EmbedderConfig, httpFetch: IHttpFetch = createHttpFetch()) {
     this.profile = config.profile || 'default';
     this.region = config.region || 'us-east-1';
     this.model = config.model || 'amazon.titan-embed-text-v2:0';
     this.dimensions = config.dimensions;
+    this.httpFetch = httpFetch;
 
     // Lazy-load the AWS SDK
     this.clientPromise = (async () => {
@@ -165,7 +174,9 @@ class BedrockEmbedder implements Embedder {
         }
         results.push(responseBody.embedding);
       } catch (err: unknown) {
-        console.error(`Bedrock embedding failed: ${err instanceof Error ? err.message : String(err)}`);
+        console.error(
+          `Bedrock embedding failed: ${err instanceof Error ? err.message : String(err)}`
+        );
         results.push([]);
       }
     }
