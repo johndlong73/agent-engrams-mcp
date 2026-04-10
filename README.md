@@ -1,46 +1,179 @@
 # Agent Engrams MCP Server
 
-An MCP (Model Context Protocol) server that provides access to a structured engram knowledge store. Agents can learn and self-improve through engram documents.
+## Table of contents
 
-## Features
+- [Introduction](#introduction)
+- [Architecture](#architecture)
+- [On-disk layout](#on-disk-layout)
+- [Quick Start](#quick-start)
+- [Tools](#tools)
+- [Configuration Reference](#configuration-reference)
+- [Engram Format](#engram-format)
+- [Transport Modes](#transport-modes)
+- [Development](#development)
+- [License](#license)
 
-- **write-engram**: Write structured engrams to capture valuable knowledge
-- **search-engrams**: Semantic search over the engram knowledge base
-- **reindex**: Force full re-index of all engram documents
-- **Seed resources**: Three seed engram documents for guidance
-- **Dual transport**: Supports both HTTP (Streamable HTTP) and local (stdio) communication
+## Introduction
 
-## Installation
+**What this is.** Agent Engrams MCP is a [Model Context Protocol](https://modelcontextprotocol.io/) server that gives coding agents a **durable, shared memory** for transferable engineering knowledge. Agents store lessons as structured markdown documents called **engrams** on your machine; the server indexes them with embeddings so agents can **search by meaning**, not just filenames. Your IDE (Cursor, VS Code, or any MCP-aware client) talks to the server over stdio; the server reads and writes files locally and calls an OpenAI-compatible embedding API when indexing and searching.
 
-```bash
-cd agent-engrams-mcp
-npm install
-npm run build
+**Why it matters.** Agent sessions are short and context windows are finite. Without a memory that survives across tasks and projects, every session starts from zero: the same debugging tricks, API quirks, and architectural lessons get rediscovered—or missed—again and again. A shared engram store turns one-off insights into **reusable** knowledge: your agent (and others using the same store) can **recall** what already worked before inventing a new dead end.
+
+**The learning flywheel.** The engram system is designed around a loop that gets stronger the more it is used honestly:
+
+1. **Recall** — Before diving into a non-trivial task, search the store. Prior work may already answer the question.
+2. **Learn** — During the task, notice **transferable** patterns (would this help on a *different* project?). That is engram-worthy.
+3. **Write** — Capture those insights in structured engrams so the next recall is richer.
+
+Each high-quality write makes the next search more useful; that encourages more search, which surfaces more opportunities to learn and write. That self-reinforcing loop is the **flywheel effect**. It stalls if the store fills with noise (low-quality writes), if agents skip search (duplicate effort), or if everything is written indiscriminately (diluted results). Quality beats quantity.
+
+```mermaid
+flowchart LR
+    Recall["Recall<br/>Search engrams<br/>before you act"]
+    Learn["Learn<br/>Spot transferable<br/>knowledge"]
+    Write["Write<br/>Capture durable<br/>engrams"]
+
+    Recall --> Learn
+    Learn --> Write
+    Write -->|"Richer store →<br/>better recall"| Recall
 ```
 
-### Global Installation (for npx usage)
+The flywheel is a habit, not a one-time setup: the MCP server is the **machinery** that stores, embeds, and retrieves engrams so that loop can run every day.
 
-To use with npx, install globally:
+## Architecture
+
+```mermaid
+graph LR
+    IDE["IDE<br/>(Cursor · VS Code)"]
+    MCP["agent-engrams-mcp<br/>MCP Server"]
+    FS["Local store<br/>ENGRAMS_DIR"]
+    EMB["Embedding Model<br/>(OpenAI-compatible API)"]
+
+    IDE -- "stdio / JSON-RPC" --> MCP
+    MCP -- "read / write under<br/>.../docs/*.md" --> FS
+    MCP -- "POST /v1/embeddings" --> EMB
+```
+
+The IDE spawns the MCP server as a child process. When an agent writes or searches engrams, the server reads and writes markdown under the store’s `docs/` folder and calls an OpenAI-compatible embedding endpoint to build query vectors and score matches.
+
+## On-disk layout
+
+`ENGRAMS_DIR` (and the `dir` field in `mcp.json`) is the **store root**, not the folder that holds markdown directly. The server creates this layout on startup if it is missing:
+
+| Path | Purpose |
+|------|---------|
+| `$ENGRAMS_DIR/docs/` | Engram markdown files (`.md`) — this is what gets indexed and searched. |
+| `$ENGRAMS_DIR/index/` | Reserved for a future on-disk vector cache. **Currently unused**; embeddings are held **in memory** and rebuilt when the server starts. |
+
+If you previously set `ENGRAMS_DIR` to a path ending in `/docs`, that still works: the server treats it as a **legacy** docs-only path (root = parent directory, docs = that path).
+
+## Quick Start
+
+### Prerequisites
+
+- **Node.js** 20+
+- An **OpenAI-compatible embedding API** (local or remote). Examples: Ollama, LM Studio, vLLM, OpenAI.
+
+### 1. Install
 
 ```bash
 npm install -g agent-engrams-mcp
 ```
 
-Or use directly from a local project:
+### 2. Configure your IDE
 
-```bash
-npx ./dist/index.js
-```
+Pick your editor and paste the JSON block into the indicated file. Adjust the `env` values to match your embedding provider.
 
-## Configuration
+#### Cursor
 
-The server reads configuration from `~/.config/agent-engrams-mcp/mcp.json` (or `$XDG_CONFIG_HOME/agent-engrams-mcp/mcp.json`, or `$MCP_CONFIG` if set). Environment variables can override file values.
-
-### mcp.json Format
+Add to **`~/.cursor/mcp.json`** (global) or **`<project>/.cursor/mcp.json`** (per-project):
 
 ```json
 {
-  "dir": "~/.config/agent-engrams-mcp/docs",
+  "mcpServers": {
+    "agent-engrams": {
+      "command": "npx",
+      "args": ["agent-engrams-mcp", "--stdio"],
+      "env": {
+        "ENGRAMS_DIR": "~/.config/agent-engrams-mcp",
+        "EMBEDDER_DIMENSIONS": "512",
+        "EMBEDDER_TYPE": "openai",
+        "EMBEDDER_BASE_URL": "http://localhost:8000/v1",
+        "EMBEDDER_API_KEY": "your-api-key",
+        "EMBEDDER_MODEL": "Qwen3-Embedding-0.6B-4bit-DWQ"
+      }
+    }
+  }
+}
+```
+
+#### Visual Studio Code
+
+Add to your **VS Code settings (JSON)**:
+
+```json
+{
+  "mcp.servers": {
+    "agent-engrams": {
+      "command": "npx",
+      "args": ["agent-engrams-mcp", "--stdio"],
+      "env": {
+        "ENGRAMS_DIR": "~/.config/agent-engrams-mcp",
+        "EMBEDDER_DIMENSIONS": "512",
+        "EMBEDDER_TYPE": "openai",
+        "EMBEDDER_BASE_URL": "http://localhost:8000/v1",
+        "EMBEDDER_API_KEY": "your-api-key",
+        "EMBEDDER_MODEL": "Qwen3-Embedding-0.6B-4bit-DWQ"
+      }
+    }
+  }
+}
+```
+
+### 3. Restart your IDE
+
+After saving the config, restart (or reload MCP servers) so the IDE picks up the new server. You should see **agent-engrams** listed among your MCP servers.
+
+That's it — your agent now has persistent memory.
+
+## Tools
+
+The server exposes three tools to the agent:
+
+| Tool | Description |
+|------|-------------|
+| **write-engram** | Capture a piece of transferable knowledge as a structured markdown file. |
+| **search-engrams** | Semantic search across all engrams by natural-language query, with optional metadata filters (category, tags, scope, durability). |
+| **reindex** | Force a full re-index of every engram on disk. |
+
+Three **seed engram resources** ship with the server to guide agents on writing and searching effectively.
+
+## Configuration Reference
+
+All settings can be provided via **environment variables** (shown above in the IDE snippets), a **JSON config file**, or **CLI arguments**. Environment variables take precedence over the config file.
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ENGRAMS_DIR` | Store root directory (`docs/` holds markdown; `index/` reserved) | `~/.config/agent-engrams-mcp` |
+| `EMBEDDER_TYPE` | Provider type: `openai`, `bedrock`, `ollama` | `openai` |
+| `EMBEDDER_BASE_URL` | Base URL for the embedding API | — |
+| `EMBEDDER_MODEL` | Embedding model name | `Qwen3-Embedding-0.6B-4bit-DWQ` |
+| `EMBEDDER_API_KEY` | API key for the embedding provider | — |
+| `EMBEDDER_DIMENSIONS` | Embedding vector dimensions | `512` |
+| `MCP_CONFIG` | Path to a JSON config file (overrides XDG default) | `~/.config/agent-engrams-mcp/mcp.json` |
+| `XDG_CONFIG_HOME` | Base config directory | `~/.config` |
+| `USE_STDIO` | Force stdio transport | — |
+| `PORT` | HTTP server port (HTTP mode only) | `3000` |
+
+### Config File
+
+If you prefer a config file over env vars, create `~/.config/agent-engrams-mcp/mcp.json`:
+
+```json
+{
+  "dir": "~/.config/agent-engrams-mcp",
   "dimensions": 512,
   "provider": {
     "type": "openai",
@@ -52,19 +185,31 @@ The server reads configuration from `~/.config/agent-engrams-mcp/mcp.json` (or `
 }
 ```
 
-### Provider Types
+A starter file is included in the repo:
 
-**OpenAI-compatible (default):**
+```bash
+mkdir -p ~/.config/agent-engrams-mcp
+cp mcp.json.example ~/.config/agent-engrams-mcp/mcp.json
+```
+
+#### Provider Examples
+
+<details>
+<summary>OpenAI-compatible (default)</summary>
+
 ```json
 {
   "type": "openai",
-  "model": "embedding-model-name",
-  "baseUrl": "http://localhost:11434/v1",
-  "apiKey": "optional-api-key"
+  "model": "text-embedding-3-small",
+  "baseUrl": "https://api.openai.com/v1",
+  "apiKey": "sk-..."
 }
 ```
+</details>
 
-**Bedrock:**
+<details>
+<summary>Bedrock</summary>
+
 ```json
 {
   "type": "bedrock",
@@ -73,8 +218,11 @@ The server reads configuration from `~/.config/agent-engrams-mcp/mcp.json` (or `
   "model": "amazon.titan-embed-text-v2:0"
 }
 ```
+</details>
 
-**Ollama:**
+<details>
+<summary>Ollama</summary>
+
 ```json
 {
   "type": "ollama",
@@ -82,77 +230,16 @@ The server reads configuration from `~/.config/agent-engrams-mcp/mcp.json` (or `
   "model": "nomic-embed-text"
 }
 ```
+</details>
 
-### Environment Variables (overrides file values)
+### CLI Arguments
 
-| Variable | Description |
-|----------|-------------|
-| `ENGrams_DIR` | Directory containing engram markdown files |
-| `EMBEDDER_TYPE` | Embedding provider type: `openai`, `bedrock`, `ollama` |
-| `EMBEDDER_BASE_URL` | Base URL for embedding API |
-| `EMBEDDER_MODEL` | Embedding model name |
-| `EMBEDDER_API_KEY` | API key for embedding provider |
-| `EMBEDDER_DIMENSIONS` | Embedding vector dimensions |
-| `MCP_CONFIG` | Custom path to config file (overrides default under XDG config dir) |
-| `XDG_CONFIG_HOME` | Base directory for config (default: `~/.config`); config lives in `agent-engrams-mcp/mcp.json` |
-| `USE_STDIO` | Set to `true` to use stdio mode |
-| `PORT` | HTTP server port (only in HTTP mode) |
-
-### Setup
-
-To create a default configuration file:
+Override any setting when starting the server directly:
 
 ```bash
-mkdir -p ~/.config/agent-engrams-mcp
-cp mcp.json.example ~/.config/agent-engrams-mcp/mcp.json
-# Edit ~/.config/agent-engrams-mcp/mcp.json with your settings
-```
-
-Or set environment variables to override values in the config file.
-
-## Usage
-
-### Start the server
-
-```bash
-npm start
-```
-
-The server will start on port 3000 by default (HTTP mode).
-
-### Stdio Mode
-
-For local process communication (e.g., with Claude Desktop), run in stdio mode:
-
-```bash
-npm start -- --stdio
-# or
-USE_STDIO=true npm start
-```
-
-### Command-Line Arguments
-
-You can override configuration values via command-line arguments:
-
-```bash
-# Override directory
-npm start -- --dir=/path/to/engrams
-
-# Override dimensions
-npm start -- --dimensions=768
-
-# Override provider (JSON format)
+npm start -- --dir=/path/to/store-root --dimensions=768
 npm start -- --provider='{"type":"openai","model":"text-embedding-3-small","baseUrl":"https://api.openai.com/v1","apiKey":"sk-..."}'
-
-# Combined usage
-npm start -- --dir=/path/to/engrams --dimensions=768 --provider='{"type":"openai","model":"text-embedding-3-small"}'
 ```
-
-### Connect as an MCP client
-
-The server implements both Streamable HTTP and stdio transports:
-- **HTTP mode**: Connect via `POST /mcp` endpoint on the configured port
-- **Stdio mode**: Spawn as a child process with stdin/stdout connected
 
 ## Engram Format
 
@@ -189,28 +276,21 @@ What was learned? What is the non-obvious part? Be specific.
 None
 ```
 
-## Seed Engrams
+## Transport Modes
 
-The server includes three seed engrams as resources:
-
-1. **engram-flywheel-effect.md**: Explains the knowledge flywheel concept
-2. **guide-to-searching-engrams.md**: How to search effectively
-3. **guide-to-writing-high-quality-engrams.md**: Best practices for writing engrams
+| Mode | How to run | Use case |
+|------|-----------|----------|
+| **stdio** (default for IDEs) | `npx agent-engrams-mcp --stdio` | Cursor, VS Code, Claude Desktop |
+| **HTTP** | `npm start` (port 3000) | Remote or multi-client setups |
 
 ## Development
 
 ```bash
-# Type check
-npm run typecheck
-
-# Lint
-npm run lint
-
-# Format
-npm run format
-
-# Build
-npm run build
+npm install
+npm run build        # compile TypeScript
+npm run typecheck    # type check only
+npm run lint         # lint
+npm run format       # check formatting
 ```
 
 ## License

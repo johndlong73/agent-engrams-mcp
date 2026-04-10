@@ -2,8 +2,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 export interface Config {
-  /** Directory to index (engrams) */
-  dir: string;
+  /** Root directory for the engrams store (markdown in docs/, index dir reserved under index/) */
+  root: string;
+  /** Directory containing engram markdown files (root/docs) */
+  docsDir: string;
+  /** Reserved path for a future on-disk vector cache (root/index); currently unused at runtime */
+  indexDir: string;
   /** Embedding dimensions */
   dimensions: number;
   /** Embedding provider config */
@@ -19,6 +23,7 @@ export type ProviderConfig =
 
 /** Raw shape stored in the config file. */
 export interface ConfigFile {
+  /** Store root: engrams live in `<dir>/docs` by convention. Legacy: path may point at `.../docs` directly. */
   dir?: string;
   dimensions?: number;
   provider?:
@@ -34,13 +39,50 @@ export const DEFAULT_OPENAI_EMBEDDING_MODEL = 'Qwen3-Embedding-0.6B-4bit-DWQ';
 const configHome =
   process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || '/tmp', '.config');
 
-const DEFAULT_DIR = path.join(configHome, 'agent-engrams-mcp', 'docs');
+const DEFAULT_ROOT = path.join(configHome, 'agent-engrams-mcp');
+
+/** Default store layout under XDG config (used for CLI-only overrides). */
+export function defaultEngramsStorePaths(): {
+  root: string;
+  docsDir: string;
+  indexDir: string;
+} {
+  return resolveEngramsStorePaths(DEFAULT_ROOT);
+}
 
 const CONFIG_PATH =
   process.env.MCP_CONFIG || path.join(configHome, 'agent-engrams-mcp', 'mcp.json');
 
 export function getConfigPath(): string {
   return CONFIG_PATH;
+}
+
+/**
+ * Resolve a normalized absolute path into store root, docs dir, and index dir.
+ * If the path basename is `docs`, treat it as a legacy docs-only path (root = parent).
+ */
+export function resolveEngramsStorePaths(resolvedAbsolute: string): {
+  root: string;
+  docsDir: string;
+  indexDir: string;
+} {
+  const normalized = path.normalize(resolvedAbsolute);
+  const base = path.basename(normalized);
+  const root = base === 'docs' ? path.dirname(normalized) : normalized;
+  const docsDir = base === 'docs' ? normalized : path.join(normalized, 'docs');
+  const indexDir = path.join(root, 'index');
+  return { root, docsDir, indexDir };
+}
+
+/** Resolve `~` and produce store paths from a user-provided path string. */
+export function resolveEngramsStoreFromInput(raw: string): {
+  root: string;
+  docsDir: string;
+  indexDir: string;
+} {
+  const home = process.env.HOME || '/tmp';
+  const resolved = path.normalize(raw.replace(/^~(?=$|[\\/])/, home));
+  return resolveEngramsStorePaths(resolved);
 }
 
 /**
@@ -59,7 +101,7 @@ export function loadConfig(): Config | null {
   }
 
   // Check env var fallback for dir (the one required field)
-  const envDir = process.env.ENGrams_DIR;
+  const envDir = process.env.ENGRAMS_DIR;
 
   if (!file && !envDir) {
     return null; // Not configured yet
@@ -67,9 +109,10 @@ export function loadConfig(): Config | null {
 
   // Build config: file values, then env overrides
   const home = process.env.HOME || '/tmp';
-  const resolvePath = (p: string) => p.replace(/^~/, home);
+  const resolvePath = (p: string) => path.normalize(p.replace(/^~(?=$|[\\/])/, home));
 
-  const dir = envDir ? resolvePath(envDir) : file?.dir ? resolvePath(file.dir) : DEFAULT_DIR;
+  const rawDir = envDir ? resolvePath(envDir) : file?.dir ? resolvePath(file.dir) : DEFAULT_ROOT;
+  const { root, docsDir, indexDir } = resolveEngramsStorePaths(rawDir);
 
   const dimensions = envInt('EMBEDDER_DIMENSIONS') ?? file?.dimensions ?? 512;
 
@@ -133,7 +176,9 @@ export function loadConfig(): Config | null {
   }
 
   return {
-    dir,
+    root,
+    docsDir,
+    indexDir,
     dimensions,
     provider,
     minSearchScore: file?.minSearchScore,

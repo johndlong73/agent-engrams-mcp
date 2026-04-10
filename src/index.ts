@@ -9,7 +9,13 @@ import * as path from 'node:path';
 import { EngramIndex, type SearchFilters, type SearchResult } from './index-store.js';
 import { createEmbedder, type EmbedderConfig } from './embedder.js';
 import { parseFrontmatter, renderEngram, slugify, normalizeScope } from './frontmatter.js';
-import { getConfigPath, loadConfig, type Config } from './config.js';
+import {
+  defaultEngramsStorePaths,
+  getConfigPath,
+  loadConfig,
+  resolveEngramsStoreFromInput,
+  type Config,
+} from './config.js';
 
 // Parse command-line arguments
 const args = process.argv.slice(2);
@@ -31,17 +37,27 @@ let config = loadConfig();
 
 // Apply CLI argument overrides
 if (argsMap.has('dir') && argsMap.get('dir')) {
-  if (!config) config = { dir: '', dimensions: 512, provider: { type: 'openai' } };
-  config.dir = argsMap.get('dir')!;
+  const paths = resolveEngramsStoreFromInput(argsMap.get('dir')!);
+  if (!config) {
+    config = { ...paths, dimensions: 512, provider: { type: 'openai' } };
+  } else {
+    config.root = paths.root;
+    config.docsDir = paths.docsDir;
+    config.indexDir = paths.indexDir;
+  }
 }
 
 if (argsMap.has('dimensions') && argsMap.get('dimensions')) {
-  if (!config) config = { dir: '', dimensions: 512, provider: { type: 'openai' } };
+  if (!config) {
+    config = { ...defaultEngramsStorePaths(), dimensions: 512, provider: { type: 'openai' } };
+  }
   config.dimensions = parseInt(argsMap.get('dimensions')!, 10);
 }
 
 if (argsMap.has('provider') && argsMap.get('provider')) {
-  if (!config) config = { dir: '', dimensions: 512, provider: { type: 'openai' } };
+  if (!config) {
+    config = { ...defaultEngramsStorePaths(), dimensions: 512, provider: { type: 'openai' } };
+  }
   try {
     config.provider = JSON.parse(argsMap.get('provider')!);
   } catch {
@@ -52,13 +68,21 @@ if (argsMap.has('provider') && argsMap.get('provider')) {
 
 if (!config) {
   console.error(
-    `MCP server not configured. Set ENGrams_DIR (and embedding env vars) or create ${getConfigPath()} (or set MCP_CONFIG).`
+    `MCP server not configured. Set ENGRAMS_DIR (and embedding env vars) or create ${getConfigPath()} (or set MCP_CONFIG).`
   );
   process.exit(1);
 }
 
-const ENGRAMS_DIR = config.dir;
-const EMBEDDER_DIMENSIONS = config.dimensions;
+const storeConfig: Config = config;
+
+function ensureStoreDirectories(cfg: Config) {
+  fs.mkdirSync(cfg.root, { recursive: true });
+  fs.mkdirSync(cfg.docsDir, { recursive: true });
+  fs.mkdirSync(cfg.indexDir, { recursive: true });
+}
+
+const DOCS_DIR = storeConfig.docsDir;
+const EMBEDDER_DIMENSIONS = storeConfig.dimensions;
 
 // Server info
 const SERVER_NAME = 'agent-engrams-mcp';
@@ -81,27 +105,27 @@ const server = new McpServer(
 let index: EngramIndex | null = null;
 let embedderConfig: EmbedderConfig;
 
-if (config.provider.type === 'openai') {
+if (storeConfig.provider.type === 'openai') {
   embedderConfig = {
     type: 'openai',
-    baseUrl: config.provider.baseUrl,
-    model: config.provider.model,
-    apiKey: config.provider.apiKey,
+    baseUrl: storeConfig.provider.baseUrl,
+    model: storeConfig.provider.model,
+    apiKey: storeConfig.provider.apiKey,
     dimensions: EMBEDDER_DIMENSIONS,
   };
-} else if (config.provider.type === 'bedrock') {
+} else if (storeConfig.provider.type === 'bedrock') {
   embedderConfig = {
     type: 'bedrock',
-    profile: config.provider.profile,
-    region: config.provider.region,
-    model: config.provider.model,
+    profile: storeConfig.provider.profile,
+    region: storeConfig.provider.region,
+    model: storeConfig.provider.model,
     dimensions: EMBEDDER_DIMENSIONS,
   };
 } else {
   embedderConfig = {
     type: 'ollama',
-    baseUrl: config.provider.url,
-    model: config.provider.model,
+    baseUrl: storeConfig.provider.url,
+    model: storeConfig.provider.model,
     dimensions: EMBEDDER_DIMENSIONS,
   };
 }
@@ -109,9 +133,9 @@ if (config.provider.type === 'openai') {
 async function initIndex() {
   const embedder = createEmbedder(embedderConfig);
   index = new EngramIndex({
-    dir: ENGRAMS_DIR,
+    dir: DOCS_DIR,
     embedder,
-    minSearchScore: config?.minSearchScore ?? 0.4,
+    minSearchScore: storeConfig.minSearchScore ?? 0.4,
   });
   await index.load();
   await index.sync();
@@ -207,20 +231,20 @@ server.registerTool(
     const markdown = renderEngram(writeParams);
     const date = new Date().toISOString().split('T')[0];
     let filename = `${date}-${slugify(p.title)}.md`;
-    let filePath = path.join(ENGRAMS_DIR, filename);
+    let filePath = path.join(DOCS_DIR, filename);
 
     let suffix = 1;
     while (fs.existsSync(filePath)) {
       filename = `${date}-${slugify(p.title)}-${suffix}.md`;
-      filePath = path.join(ENGRAMS_DIR, filename);
+      filePath = path.join(DOCS_DIR, filename);
       suffix++;
     }
 
-    fs.mkdirSync(ENGRAMS_DIR, { recursive: true });
+    fs.mkdirSync(DOCS_DIR, { recursive: true });
     fs.writeFileSync(filePath, markdown, 'utf-8');
 
     // Update index
-    await index.updateFile(filePath, ENGRAMS_DIR);
+    await index.updateFile(filePath, DOCS_DIR);
 
     const home = process.env.HOME || '';
     const displayPath = filePath.replace(home, '~');
@@ -428,6 +452,7 @@ async function loadSeedEngrams(): Promise<void> {
 
 // Main
 async function main() {
+  ensureStoreDirectories(storeConfig);
   // Initialize index
   await initIndex();
   
@@ -444,7 +469,7 @@ async function main() {
     transport = new StdioServerTransport();
     // One line on stderr for operators; avoid console.error so Cursor does not tag it as [error].
     process.stderr.write(
-      `[agent-engrams-mcp] stdio | dir=${ENGRAMS_DIR} | indexed=${index?.size() ?? 0} engrams\n`
+      `[agent-engrams-mcp] stdio | root=${storeConfig.root} docs=${DOCS_DIR} indexDir=${storeConfig.indexDir} | indexed=${index?.size() ?? 0} engrams\n`
     );
   } else {
     // Use Streamable HTTP transport
@@ -464,7 +489,9 @@ async function main() {
       console.log(`Engram MCP server running on port ${PORT}`);
       console.log(`Server name: ${SERVER_NAME}`);
       console.log(`Version: ${SERVER_VERSION}`);
-      console.log(`Engrams directory: ${ENGRAMS_DIR}`);
+      console.log(`Store root: ${storeConfig.root}`);
+      console.log(`Engrams docs: ${DOCS_DIR}`);
+      console.log(`Index dir (reserved): ${storeConfig.indexDir}`);
       console.log(`Index size: ${index?.size() || 0} engrams`);
     });
     

@@ -1,5 +1,5 @@
 {
-  "dir": "~/.config/agent-engrams-mcp/docs",
+  "dir": "~/.config/agent-engrams-mcp",
   "dimensions": 512,
   "provider": {
     "type": "openai",
