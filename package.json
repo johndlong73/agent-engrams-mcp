@@ -1,0 +1,55 @@
+{
+  "name": "agent-engrams-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MCP server for agent engrams (structured agent knowledge store)",
+  "keywords": ["mcp", "agent", "knowledge-base"],
+  "license": "Apache-2.0",
+  "author": "johndlong73",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/johndlong73/agent-engrams-mcp"
+  },
+  "bin": {
+    "agent-engrams-mcp": "./dist/index.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "format": "prettier --check src",
+    "format:fix": "prettier --write src",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0-alpha.2",
+    "@modelcontextprotocol/node": "^2.0.0-alpha.2",
+    "@modelcontextprotocol/express": "^2.0.0-alpha.2",
+    "express": "^4.18.2",
+    "zod": "^3.23.0",
+    "yaml": "^2.4.0",
+    "@cfworker/json-schema": "^4.1.1"
+  },
+  "optionalDependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.750.0",
+    "@aws-sdk/credential-providers": "^3.750.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@eslint/markdown": "^8.0.1",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.58.0",
+    "@typescript-eslint/parser": "^8.58.0",
+    "eslint": "^10.2.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.5",
+    "globals": "^17.4.0",
+    "prettier": "^3.8.1",
+    "typescript": "~6.0.0"
+  }
+}

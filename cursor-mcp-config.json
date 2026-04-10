@@ -1,0 +1,6 @@
+{
+  "agent-engrams-mcp": {
+    "command": "npx",
+    "args": ["agent-engrams-mcp@latest", "--stdio"]
+  }
+}
